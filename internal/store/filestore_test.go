@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -22,7 +23,7 @@ func TestFileStore_CRUDAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取失败: %v", err)
 	}
-	if got != rec {
+	if !reflect.DeepEqual(got, rec) {
 		t.Fatalf("读写内容不一致: %+v", got)
 	}
 

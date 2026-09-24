@@ -18,14 +18,26 @@ import (
 // ErrNotFound 表示按名字取不到对应档案。
 var ErrNotFound = errors.New("装载状态档不存在")
 
+// TankRecord 是随装载状态档一并持久化的一个液舱，纯数据、不含业务逻辑。
+// 液舱从属于档案：只随其所属档案存取，不同档案的液舱互不串扰。
+type TankRecord struct {
+	Name               string  `json:"name,omitempty"`
+	Length             float64 `json:"length,omitempty"`
+	Width              float64 `json:"width,omitempty"`
+	FreeSurfaceInertia float64 `json:"freeSurfaceInertia,omitempty"`
+	LiquidDensity      float64 `json:"liquidDensity"`
+	Status             string  `json:"status"`
+}
+
 // Record 是一条被持久化的装载状态档，纯数据、不含业务逻辑。
 type Record struct {
-	Name               string  `json:"name"`
-	DisplacementVolume float64 `json:"displacementVolume"`
-	KB                 float64 `json:"kb"`
-	KG                 float64 `json:"kg"`
-	TransverseInertia  float64 `json:"transverseInertia"`
-	WaterDensity       float64 `json:"waterDensity"`
+	Name               string       `json:"name"`
+	DisplacementVolume float64      `json:"displacementVolume"`
+	KB                 float64      `json:"kb"`
+	KG                 float64      `json:"kg"`
+	TransverseInertia  float64      `json:"transverseInertia"`
+	WaterDensity       float64      `json:"waterDensity"`
+	Tanks              []TankRecord `json:"tanks,omitempty"`
 }
 
 // Store 是档案存储的抽象，业务层只依赖该接口，便于替换实现与测试。

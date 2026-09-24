@@ -3,6 +3,7 @@ package archive
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -41,7 +42,7 @@ func TestService_SaveGetResolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("取档失败: %v", err)
 	}
-	if got != c {
+	if !reflect.DeepEqual(got, c) {
 		t.Fatalf("取档内容不一致: %+v vs %+v", got, c)
 	}
 	p, err := svc.ResolveParams("ship-a")

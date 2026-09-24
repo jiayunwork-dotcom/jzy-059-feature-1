@@ -58,9 +58,22 @@ type Result struct {
 	AngleRad float64 `json:"angleRad"`
 	// BM 横稳心半径 BM = IT/∇ (m)。
 	BM float64 `json:"bm"`
-	// GM 初稳性高度 GM = KB + BM − KG (m)。
+	// GM 本次判定实际采用的初稳性高度 (m)：不带液舱时等于按固体算的
+	// GM；带液舱时为自由液面修正后的有效 GM（= EffectiveGM）。
+	// GZ、复原力矩与稳性判定均站在这个值上。
 	GM float64 `json:"gm"`
-	// GZ 复原力臂 GZ = GM·sinφ (m)，φ 以弧度代入。
+	// SolidGM 按固体重量分布算的初稳性高度 GM = KB + BM − KG (m)，
+	// 不因挂不挂液舱而改变。
+	SolidGM float64 `json:"solidGM"`
+	// FreeSurfaceCorrection 自由液面修正总扣减 Σδ_i (m)，恒非负；
+	// 空舱/满舱及不带液舱时为 0。
+	FreeSurfaceCorrection float64 `json:"freeSurfaceCorrection"`
+	// EffectiveGM 修正后的有效初稳性高度 = SolidGM − FreeSurfaceCorrection (m)。
+	EffectiveGM float64 `json:"effectiveGM"`
+	// TankCorrections 各液舱的扣减明细；无液舱时省略。
+	TankCorrections []TankCorrection `json:"tankCorrections,omitempty"`
+	// GZ 复原力臂 GZ = GM·sinφ (m)，φ 以弧度代入；
+	// 带液舱时 GM 取有效 GM。
 	GZ float64 `json:"gz"`
 	// DisplacementMass 排水质量 Δ = ρ∇ (kg)。
 	DisplacementMass float64 `json:"displacementMass"`
@@ -153,6 +166,8 @@ func EvaluateAt(p Params, phiRad float64) Result {
 		AngleRad:         phiRad,
 		BM:               bm,
 		GM:               gm,
+		SolidGM:          gm,
+		EffectiveGM:      gm,
 		GZ:               gz,
 		DisplacementMass: mass,
 		RightingMoment:   moment,
