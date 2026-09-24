@@ -10,6 +10,7 @@
 package stability
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 )
@@ -70,8 +71,45 @@ type Result struct {
 	Stability string `json:"stability"`
 	// SmallAngle 该点是否仍在小倾角近似范围内（|φ| ≤ 10°）。
 	SmallAngle bool `json:"smallAngle"`
+
+	// 以下四个字段是自由液面修正层（见 freesurface.go）携带的信息，
+	// 仅在请求附带液舱时由 MarshalJSON 展开；不带液舱的纯固体核算不输出
+	// 它们（TankCorrections == nil 即为不带液舱），因而原有接口的响应
+	// 与从前完全一致。直接用指针字段是为了让「有效 GM 恰好为 0」这种
+	// 临界情形也不会被 omitempty 吞掉字段。
+
+	// SolidGM 按固体重量分布算出的初稳性高度（未经修正）(m)。
+	SolidGM float64 `json:"-"`
+	// FreeSurfaceCorrection 自由液面总扣减 (m)，从 SolidGM 中减去。
+	FreeSurfaceCorrection float64 `json:"-"`
+	// EffectiveGM 修正后的有效初稳性高度 (m)，与 GM 同值；GM 已是修正后的值。
+	EffectiveGM float64 `json:"-"`
+	// TankCorrections 逐舱扣减明细；nil 表示本次核算不含液舱维度。
+	TankCorrections []TankCorrection `json:"-"`
+
 	// Warning 非空时表示本次计算存在需要设计者注意的事项。
 	Warning string `json:"warning,omitempty"`
+}
+
+// MarshalJSON 保证「无液舱」时响应与旧版逐字段一致；携带液舱时
+// 再展开固体 GM / 总扣减 / 有效 GM / 逐舱明细，且有效 GM 即使为 0
+// 也照样输出（不能因 omitempty 把临界中性的账吞掉）。
+func (r Result) MarshalJSON() ([]byte, error) {
+	type plain Result
+	out := struct {
+		plain
+		SolidGM               *float64          `json:"solidGm,omitempty"`
+		FreeSurfaceCorrection *float64          `json:"freeSurfaceCorrection,omitempty"`
+		EffectiveGM           *float64          `json:"effectiveGm,omitempty"`
+		TankCorrections       *[]TankCorrection `json:"tankCorrections,omitempty"`
+	}{plain: plain(r)}
+	if r.TankCorrections != nil {
+		solid, corr, eff := r.SolidGM, r.FreeSurfaceCorrection, r.EffectiveGM
+		tanks := r.TankCorrections
+		out.SolidGM, out.FreeSurfaceCorrection, out.EffectiveGM = &solid, &corr, &eff
+		out.TankCorrections = &tanks
+	}
+	return json.Marshal(out)
 }
 
 // 初稳性判定标签。

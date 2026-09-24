@@ -26,6 +26,9 @@ type Condition struct {
 	KG                 float64 `json:"kg"`
 	TransverseInertia  float64 `json:"transverseInertia"`
 	WaterDensity       float64 `json:"waterDensity"`
+	// Tanks 随船携带的液舱清单，是这份档案的一部分；
+	// 为空表示该档按纯固体浮态核算。
+	Tanks []stability.Tank `json:"tanks,omitempty"`
 }
 
 // ValidateName 校验档名。
@@ -56,7 +59,7 @@ func (c Condition) ToParams() (stability.Params, error) {
 }
 
 func toRecord(c Condition) store.Record {
-	return store.Record{
+	rec := store.Record{
 		Name:               c.Name,
 		DisplacementVolume: c.DisplacementVolume,
 		KB:                 c.KB,
@@ -64,10 +67,21 @@ func toRecord(c Condition) store.Record {
 		TransverseInertia:  c.TransverseInertia,
 		WaterDensity:       c.WaterDensity,
 	}
+	for _, t := range c.Tanks {
+		rec.Tanks = append(rec.Tanks, store.TankRecord{
+			Name:               t.Name,
+			Length:             t.Length,
+			Width:              t.Width,
+			FreeSurfaceInertia: t.FreeSurfaceInertia,
+			LiquidDensity:      t.LiquidDensity,
+			FillingStatus:      t.FillingStatus,
+		})
+	}
+	return rec
 }
 
 func fromRecord(r store.Record) Condition {
-	return Condition{
+	c := Condition{
 		Name:               r.Name,
 		DisplacementVolume: r.DisplacementVolume,
 		KB:                 r.KB,
@@ -75,6 +89,17 @@ func fromRecord(r store.Record) Condition {
 		TransverseInertia:  r.TransverseInertia,
 		WaterDensity:       r.WaterDensity,
 	}
+	for _, tr := range r.Tanks {
+		c.Tanks = append(c.Tanks, stability.Tank{
+			Name:               tr.Name,
+			Length:             tr.Length,
+			Width:              tr.Width,
+			FreeSurfaceInertia: tr.FreeSurfaceInertia,
+			LiquidDensity:      tr.LiquidDensity,
+			FillingStatus:      tr.FillingStatus,
+		})
+	}
+	return c
 }
 
 // Service 是装载状态档管理服务。
@@ -87,12 +112,16 @@ func NewService(s store.Store) *Service {
 	return &Service{store: s}
 }
 
-// Save 校验名字与浮态参数后建档/覆盖。
+// Save 校验名字、浮态参数与液舱清单后建档/覆盖。液舱是档案的一部分，
+// 不合规的舱会让整份档案被挡在落库之前，并指明是哪个舱、哪个字段。
 func (svc *Service) Save(c Condition) error {
 	if err := ValidateName(strings.TrimSpace(c.Name)); err != nil {
 		return err
 	}
 	if _, err := c.ToParams(); err != nil {
+		return err
+	}
+	if err := stability.ValidateTanks(c.Tanks); err != nil {
 		return err
 	}
 	return svc.store.Put(toRecord(c))
@@ -139,6 +168,20 @@ func (svc *Service) ResolveParams(name string) (stability.Params, error) {
 		return stability.Params{}, err
 	}
 	return c.ToParams()
+}
+
+// ResolveLoading 按名取档，连同液舱清单一起还原，供修正后的核算/扫描使用。
+// 液舱只属于被取到的这份档案：不同档名各取各的清单，互不串扰。
+func (svc *Service) ResolveLoading(name string) (stability.Params, []stability.Tank, error) {
+	c, err := svc.Get(name)
+	if err != nil {
+		return stability.Params{}, nil, err
+	}
+	p, err := c.ToParams()
+	if err != nil {
+		return stability.Params{}, nil, err
+	}
+	return p, c.Tanks, nil
 }
 
 // SeedDefaults 幂等预置内置算例：档案已存在则保留用户数据不动。

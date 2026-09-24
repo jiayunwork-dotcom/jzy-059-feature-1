@@ -297,6 +297,407 @@ func TestConditionLifecycle(t *testing.T) {
 	}
 }
 
+// 宽舱构造：内联浮态用基准船（固体 GM=4.2）。
+func inlinePartialTank(name string, length, width, density float64) map[string]any {
+	return map[string]any{
+		"name":          name,
+		"length":        length,
+		"width":         width,
+		"liquidDensity": density,
+		"fillingStatus": "partial",
+	}
+}
+
+func inlineBaseParams() map[string]any {
+	return map[string]any{
+		"displacementVolume": 1000,
+		"kb":                 1.2,
+		"kg":                 2.0,
+		"transverseInertia":  5000,
+	}
+}
+
+// 内联液舱的单点核算：响应把三笔账与逐舱明细写明，GZ 按有效 GM。
+func TestEvaluate_WithInlineTanks(t *testing.T) {
+	r, _ := newTestRouter(t)
+	code, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"params":   inlineBaseParams(),
+		"angleDeg": 5,
+		"tanks": []map[string]any{
+			inlinePartialTank("fuel", 4, 2, 900),
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d: %v", code, body)
+	}
+	res := body["result"].(map[string]any)
+	if math.Abs(res["solidGm"].(float64)-4.2) > 1e-9 {
+		t.Fatalf("固体 GM 应为 4.2: %v", res["solidGm"])
+	}
+	wantCorr := 900.0 * (4.0 * 8.0 / 12.0) / (1025.0 * 1000.0)
+	if math.Abs(res["freeSurfaceCorrection"].(float64)-wantCorr) > 1e-12 {
+		t.Fatalf("总扣减异常: got %v want %v", res["freeSurfaceCorrection"], wantCorr)
+	}
+	wantEff := 4.2 - wantCorr
+	if math.Abs(res["effectiveGm"].(float64)-wantEff) > 1e-9 {
+		t.Fatalf("有效 GM 异常: %v", res["effectiveGm"])
+	}
+	if math.Abs(res["gm"].(float64)-wantEff) > 1e-9 {
+		t.Fatalf("gm 应为修正后的值: %v", res["gm"])
+	}
+	if body["stability"] != "positive" || body["positive"] != true {
+		t.Fatalf("仍应判正稳性: %v", body)
+	}
+	wantGZ := wantEff * math.Sin(5*math.Pi/180)
+	if math.Abs(res["gz"].(float64)-wantGZ) > 1e-9 {
+		t.Fatalf("GZ 必须按有效 GM: got %v want %v", res["gz"], wantGZ)
+	}
+	tanks := res["tankCorrections"].([]any)
+	if len(tanks) != 1 {
+		t.Fatalf("应有一条舱明细: %v", tanks)
+	}
+	d := tanks[0].(map[string]any)
+	if math.Abs(d["correction"].(float64)-wantCorr) > 1e-12 || d["fillingStatus"] != "partial" {
+		t.Fatalf("舱明细异常: %v", d)
+	}
+}
+
+// 空舱/满舱扣减为零；只改状态，同一几何立刻不再折损稳性。
+func TestEvaluate_EmptyAndFullTanksNoCorrection(t *testing.T) {
+	r, _ := newTestRouter(t)
+	for _, status := range []string{"empty", "full"} {
+		tank := inlinePartialTank("fuel", 4, 2, 900)
+		tank["fillingStatus"] = status
+		_, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+			"params":   inlineBaseParams(),
+			"angleDeg": 5,
+			"tanks":    []map[string]any{tank},
+		})
+		res := body["result"].(map[string]any)
+		if res["freeSurfaceCorrection"].(float64) != 0 {
+			t.Fatalf("%s 舱扣减应为零: %v", status, res["freeSurfaceCorrection"])
+		}
+		if math.Abs(res["effectiveGm"].(float64)-4.2) > 1e-12 {
+			t.Fatalf("%s 舱有效 GM 应等于固体 GM: %v", status, res["effectiveGm"])
+		}
+		if body["stability"] != "positive" {
+			t.Fatalf("%s 舱不应改变正稳性判定", status)
+		}
+	}
+}
+
+// 端到端翻转：不带舱 positive，挂上足够多宽舱后判定翻成 negative。
+func TestEvaluate_TanksFlipStabilityToNegative(t *testing.T) {
+	r, _ := newTestRouter(t)
+	// 先确认不带舱是正稳性。
+	code, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"params": inlineBaseParams(), "angleDeg": 5,
+	})
+	if code != 200 || body["stability"] != "positive" {
+		t.Fatalf("前置：应正稳性，得到 %d %v", code, body)
+	}
+
+	tanks := []map[string]any{
+		inlinePartialTank("w1", 2, 22, 1000),
+		inlinePartialTank("w2", 2, 22, 1000),
+		inlinePartialTank("w3", 2, 22, 1000),
+	}
+	code, body = doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"params": inlineBaseParams(), "angleDeg": 5, "tanks": tanks,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d: %v", code, body)
+	}
+	if body["stability"] != "negative" || body["positive"] != false {
+		t.Fatalf("挂舱后必须翻成负稳性: %v", body)
+	}
+	res := body["result"].(map[string]any)
+	if res["solidGm"].(float64) <= 0 || res["effectiveGm"].(float64) >= 0 {
+		t.Fatalf("固体 GM 为正、有效 GM 应为负: solid=%v eff=%v",
+			res["solidGm"], res["effectiveGm"])
+	}
+	if res["gz"].(float64) >= 0 {
+		t.Fatalf("正横倾下负稳性 GZ 应为负: %v", res["gz"])
+	}
+
+	// 同一批舱灌满：稳性回到正，证明翻转完全由自由液面造成。
+	for _, tk := range tanks {
+		tk["fillingStatus"] = "full"
+	}
+	_, bodyFull := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"params": inlineBaseParams(), "angleDeg": 5, "tanks": tanks,
+	})
+	if bodyFull["stability"] != "positive" {
+		t.Fatalf("灌满后应回到正稳性: %v", bodyFull)
+	}
+}
+
+// 0° 横倾 GZ 恒为零，即使挂舱后有效 GM 已为负。
+func TestEvaluate_TanksZeroAngleGZZero(t *testing.T) {
+	r, _ := newTestRouter(t)
+	tanks := []map[string]any{
+		inlinePartialTank("w1", 2, 22, 1000),
+		inlinePartialTank("w2", 2, 22, 1000),
+		inlinePartialTank("w3", 2, 22, 1000),
+	}
+	_, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"params": inlineBaseParams(), "tanks": tanks, // angleDeg 省略 = 0
+	})
+	res := body["result"].(map[string]any)
+	if res["gz"].(float64) != 0 || res["rightingMoment"].(float64) != 0 {
+		t.Fatalf("0° 时 GZ/力矩必须恒零: %v", res)
+	}
+	if body["stability"] != "negative" {
+		t.Fatalf("该装载应为负稳性（证明确实挂了舱）: %v", body)
+	}
+}
+
+// 带舱扫描：头部三笔账齐全，整条曲线按有效 GM。
+func TestScanEndpoint_WithTanks(t *testing.T) {
+	r, _ := newTestRouter(t)
+	code, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/scan", map[string]any{
+		"params":   inlineBaseParams(),
+		"tanks":    []map[string]any{inlinePartialTank("fuel", 4, 2, 900)},
+		"startDeg": 0,
+		"endDeg":   10,
+		"stepDeg":  2,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("扫描失败: %d %v", code, body)
+	}
+	wantCorr := 900.0 * (4.0 * 8.0 / 12.0) / (1025.0 * 1000.0)
+	wantEff := 4.2 - wantCorr
+	if math.Abs(body["solidGm"].(float64)-4.2) > 1e-9 {
+		t.Fatalf("固体 GM 异常: %v", body["solidGm"])
+	}
+	if math.Abs(body["effectiveGm"].(float64)-wantEff) > 1e-9 {
+		t.Fatalf("有效 GM 异常: %v", body["effectiveGm"])
+	}
+	if math.Abs(body["gm"].(float64)-wantEff) > 1e-9 {
+		t.Fatalf("gm 应为有效 GM: %v", body["gm"])
+	}
+	points := body["points"].([]any)
+	for i, p := range points {
+		pt := p.(map[string]any)
+		deg := float64(i * 2)
+		wantGZ := wantEff * math.Sin(deg*math.Pi/180)
+		if math.Abs(pt["gz"].(float64)-wantGZ) > 1e-9 {
+			t.Fatalf("点 %d GZ 未按有效 GM: got %v want %v", i, pt["gz"], wantGZ)
+		}
+	}
+}
+
+// 液舱建档、取回、按名修正核算、覆盖改舱、删档的完整生命周期。
+func TestConditionLifecycle_WithTanks(t *testing.T) {
+	r, _ := newTestRouter(t)
+
+	// 建档时登记两个部分注液舱。
+	tanks := []map[string]any{
+		inlinePartialTank("fuel", 4, 2, 900),
+		inlinePartialTank("ballast", 6, 3, 1000),
+	}
+	code, body := doJSON(t, r, http.MethodPut, "/api/v1/conditions/tanker", map[string]any{
+		"displacementVolume": 1000,
+		"kb":                 1.2,
+		"kg":                 2.0,
+		"transverseInertia":  5000,
+		"waterDensity":       1025,
+		"tanks":              tanks,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("带舱建档失败: %d %v", code, body)
+	}
+
+	// 取档：液舱清单原样还原。
+	_, body = doJSON(t, r, http.MethodGet, "/api/v1/conditions/tanker", nil)
+	cond := body["condition"].(map[string]any)
+	gotTanks := cond["tanks"].([]any)
+	if len(gotTanks) != 2 || gotTanks[1].(map[string]any)["name"] != "ballast" {
+		t.Fatalf("取回的液舱清单异常: %v", gotTanks)
+	}
+
+	// 按名核算：自动带上档案内液舱做修正。
+	_, body = doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"conditionName": "tanker",
+		"angleDeg":      0,
+	})
+	res := body["result"].(map[string]any)
+	wantCorr := 900.0*(4.0*8.0/12.0)/(1025.0*1000.0) +
+		1000.0*(6.0*27.0/12.0)/(1025.0*1000.0)
+	if math.Abs(res["freeSurfaceCorrection"].(float64)-wantCorr) > 1e-12 {
+		t.Fatalf("按名核算总扣减异常: got %v want %v", res["freeSurfaceCorrection"], wantCorr)
+	}
+	if math.Abs(res["solidGm"].(float64)-4.2) > 1e-9 {
+		t.Fatalf("固体 GM 应为 4.2: %v", res["solidGm"])
+	}
+	if math.Abs(res["effectiveGm"].(float64)-(4.2-wantCorr)) > 1e-9 {
+		t.Fatalf("有效 GM 异常: %v", res["effectiveGm"])
+	}
+
+	// 覆盖：把两个舱都改成满舱。
+	fullTanks := []map[string]any{
+		{"name": "fuel", "length": 4.0, "width": 2.0, "liquidDensity": 900.0, "fillingStatus": "full"},
+		{"name": "ballast", "length": 6.0, "width": 3.0, "liquidDensity": 1000.0, "fillingStatus": "full"},
+	}
+	code, _ = doJSON(t, r, http.MethodPut, "/api/v1/conditions/tanker", map[string]any{
+		"displacementVolume": 1000, "kb": 1.2, "kg": 2.0, "transverseInertia": 5000,
+		"tanks": fullTanks,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("覆盖档案失败: %d", code)
+	}
+	_, body = doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"conditionName": "tanker",
+	})
+	res = body["result"].(map[string]any)
+	if res["freeSurfaceCorrection"].(float64) != 0 {
+		t.Fatalf("灌满后扣减应为零: %v", res["freeSurfaceCorrection"])
+	}
+
+	// 覆盖成不带 tanks：档案退回纯固体，响应不再有修正字段。
+	doJSON(t, r, http.MethodPut, "/api/v1/conditions/tanker", map[string]any{
+		"displacementVolume": 1000, "kb": 1.2, "kg": 2.0, "transverseInertia": 5000,
+	})
+	_, body = doJSON(t, r, http.MethodGet, "/api/v1/conditions/tanker", nil)
+	if tanks, ok := body["condition"].(map[string]any)["tanks"]; ok && tanks != nil {
+		t.Fatalf("清空舱单后不应再返回 tanks: %v", tanks)
+	}
+
+	// 删除：整档含舱消失。
+	code, _ = doJSON(t, r, http.MethodDelete, "/api/v1/conditions/tanker", nil)
+	if code != http.StatusOK {
+		t.Fatalf("删除失败: %d", code)
+	}
+	code, _ = doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"conditionName": "tanker",
+	})
+	if code != http.StatusNotFound {
+		t.Fatalf("删档后按名核算应 404，得到 %d", code)
+	}
+}
+
+// 液舱校验错误一律 400 且带中文原因，点得清哪个字段。
+func TestEvaluate_BadTankRejected(t *testing.T) {
+	r, _ := newTestRouter(t)
+	cases := []map[string]any{
+		// 状态取值不在允许集合
+		{"params": inlineBaseParams(), "tanks": []map[string]any{
+			{"name": "t", "length": 4.0, "width": 2.0, "liquidDensity": 900.0, "fillingStatus": "half"}}},
+		// 缺注液状态
+		{"params": inlineBaseParams(), "tanks": []map[string]any{
+			{"name": "t", "length": 4.0, "width": 2.0, "liquidDensity": 900.0}}},
+		// 密度非正
+		{"params": inlineBaseParams(), "tanks": []map[string]any{
+			{"name": "t", "length": 4.0, "width": 2.0, "liquidDensity": 0.0, "fillingStatus": "partial"}}},
+		// 尺寸非正（宽为零且未给惯性矩）
+		{"params": inlineBaseParams(), "tanks": []map[string]any{
+			{"name": "t", "length": 4.0, "width": 0.0, "liquidDensity": 900.0, "fillingStatus": "partial"}}},
+		// 直给惯性矩为负
+		{"params": inlineBaseParams(), "tanks": []map[string]any{
+			{"name": "t", "freeSurfaceInertia": -2.0, "liquidDensity": 900.0, "fillingStatus": "partial"}}},
+	}
+	for i, payload := range cases {
+		code, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", payload)
+		if code != http.StatusBadRequest {
+			t.Fatalf("用例 #%d 应 400，得到 %d: %v", i, code, body)
+		}
+		reason, _ := body["reason"].(string)
+		if reason == "" {
+			t.Fatalf("用例 #%d 必须带中文原因", i)
+		}
+	}
+
+	// 建档携带非法舱同样 400。
+	code, body := doJSON(t, r, http.MethodPost, "/api/v1/conditions", map[string]any{
+		"name":               "bad-tanker",
+		"displacementVolume": 1000, "kb": 1.2, "kg": 2.0, "transverseInertia": 5000,
+		"tanks": []map[string]any{
+			{"name": "t", "length": 4.0, "width": 2.0, "liquidDensity": -1.0, "fillingStatus": "partial"},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("非法舱建档应 400，得到 %d: %v", code, body)
+	}
+	// 被拒档案不得落库。
+	if code, _ := doJSON(t, r, http.MethodGet, "/api/v1/conditions/bad-tanker", nil); code != http.StatusNotFound {
+		t.Fatalf("被拒档案不应落库，得到 %d", code)
+	}
+
+	// 引用档名同时内联液舱：拒绝，避免舱来源含糊。
+	code, body = doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+		"conditionName": "rectangular-barge",
+		"tanks":         []map[string]any{inlinePartialTank("x", 4, 2, 900)},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("档名与 tanks 同给应 400，得到 %d: %v", code, body)
+	}
+}
+
+// 不同档案各带各的舱，并发按名核算互不串舱。
+func TestHTTP_ConcurrentTankIsolation(t *testing.T) {
+	r, _ := newTestRouter(t)
+	const n = 30
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("tanker-%02d", i)
+		width := 1.0 + float64(i)*0.2 // 舱宽各异 ⇒ 扣减各异
+		code, _ := doJSON(t, r, http.MethodPut, "/api/v1/conditions/"+name, map[string]any{
+			"displacementVolume": 1000, "kb": 1.2, "kg": 2.0, "transverseInertia": 5000,
+			"tanks": []map[string]any{inlinePartialTank("only", 4, width, 900)},
+		})
+		if code != http.StatusOK {
+			t.Fatalf("建档 %s 失败: %d", name, code)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan string, 2*n)
+	for i := 0; i < n; i++ {
+		i := i
+		name := fmt.Sprintf("tanker-%02d", i)
+		width := 1.0 + float64(i)*0.2
+		wantCorr := 900.0 * (4.0 * width * width * width / 12.0) / (1025.0 * 1000.0)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+				"conditionName": name,
+				"angleDeg":      5,
+			})
+			res := body["result"].(map[string]any)
+			if math.Abs(res["freeSurfaceCorrection"].(float64)-wantCorr) > 1e-9 {
+				errCh <- fmt.Sprintf("%s 扣减串舱: got %v want %v",
+					name, res["freeSurfaceCorrection"], wantCorr)
+			}
+			if math.Abs(res["solidGm"].(float64)-4.2) > 1e-9 {
+				errCh <- fmt.Sprintf("%s 固体 GM 异常: %v", name, res["solidGm"])
+			}
+		}()
+	}
+	// 不带舱的预置档被并发重算：永远不出现修正字段。
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, body := doJSON(t, r, http.MethodPost, "/api/v1/stability/evaluate", map[string]any{
+				"conditionName": "rectangular-barge",
+				"angleDeg":      5,
+			})
+			res := body["result"].(map[string]any)
+			if _, present := res["effectiveGm"]; present {
+				errCh <- "无舱档案不应返回自由液面修正字段"
+			}
+			if math.Abs(res["gm"].(float64)-4.05) > 1e-9 {
+				errCh <- fmt.Sprintf("预置驳船 GM 被污染: %v", res["gm"])
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for msg := range errCh {
+		t.Error(msg)
+	}
+}
+
 // 通过 HTTP 并发打不同名字与同名的计算，验证服务层并发隔离。
 func TestHTTP_ConcurrentConditionIsolation(t *testing.T) {
 	r, _ := newTestRouter(t)

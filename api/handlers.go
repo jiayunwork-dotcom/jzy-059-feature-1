@@ -59,10 +59,57 @@ type paramsPayload struct {
 	WaterDensity       float64 `json:"waterDensity"`
 }
 
+// tankPayload 描述一个随船携带的液舱。
+// 液面几何给法二选一：length+width（矩形液面）或直接给 freeSurfaceInertia。
+type tankPayload struct {
+	Name               string  `json:"name"`
+	Length             float64 `json:"length"`
+	Width              float64 `json:"width"`
+	FreeSurfaceInertia float64 `json:"freeSurfaceInertia,omitempty"`
+	LiquidDensity      float64 `json:"liquidDensity"`
+	FillingStatus      string  `json:"fillingStatus"`
+}
+
+func toTanks(tps []tankPayload) []stability.Tank {
+	tanks := make([]stability.Tank, 0, len(tps))
+	for _, t := range tps {
+		tanks = append(tanks, stability.Tank{
+			Name:               t.Name,
+			Length:             t.Length,
+			Width:              t.Width,
+			FreeSurfaceInertia: t.FreeSurfaceInertia,
+			LiquidDensity:      t.LiquidDensity,
+			FillingStatus:      t.FillingStatus,
+		})
+	}
+	return tanks
+}
+
+func fromTanks(tanks []stability.Tank) []tankPayload {
+	if len(tanks) == 0 {
+		return nil // 无舱时序列化为字段缺省，而不是 []
+	}
+	out := make([]tankPayload, 0, len(tanks))
+	for _, t := range tanks {
+		out = append(out, tankPayload{
+			Name:               t.Name,
+			Length:             t.Length,
+			Width:              t.Width,
+			FreeSurfaceInertia: t.FreeSurfaceInertia,
+			LiquidDensity:      t.LiquidDensity,
+			FillingStatus:      t.FillingStatus,
+		})
+	}
+	return out
+}
+
 // evaluateRequest 单点核算请求：可按已存档名引用，也可内联给出参数。
 type evaluateRequest struct {
 	ConditionName string         `json:"conditionName"`
 	Params        *paramsPayload `json:"params"`
+	// Tanks 内联/附加的液舱清单；省略或为空表示按纯固体核算。
+	// 引用档名时，档案自带的液舱会与这里给出的清单合并。
+	Tanks []tankPayload `json:"tanks"`
 	// AngleDeg 横倾角（度）；省略时按正浮 0° 处理。
 	AngleDeg float64 `json:"angleDeg"`
 }
@@ -71,6 +118,7 @@ type evaluateRequest struct {
 type scanRequest struct {
 	ConditionName string         `json:"conditionName"`
 	Params        *paramsPayload `json:"params"`
+	Tanks         []tankPayload  `json:"tanks"`
 	StartDeg      *float64       `json:"startDeg"`
 	EndDeg        *float64       `json:"endDeg"`
 	StepDeg       *float64       `json:"stepDeg"`
@@ -78,12 +126,13 @@ type scanRequest struct {
 
 // conditionPayload 建档请求体（POST 时名字在体内，PUT 时名字取自路径）。
 type conditionPayload struct {
-	Name               string  `json:"name"`
-	DisplacementVolume float64 `json:"displacementVolume"`
-	KB                 float64 `json:"kb"`
-	KG                 float64 `json:"kg"`
-	TransverseInertia  float64 `json:"transverseInertia"`
-	WaterDensity       float64 `json:"waterDensity"`
+	Name               string        `json:"name"`
+	DisplacementVolume float64       `json:"displacementVolume"`
+	KB                 float64       `json:"kb"`
+	KG                 float64       `json:"kg"`
+	TransverseInertia  float64       `json:"transverseInertia"`
+	WaterDensity       float64       `json:"waterDensity"`
+	Tanks              []tankPayload `json:"tanks"`
 }
 
 func toParams(p paramsPayload) stability.Params {
@@ -104,30 +153,59 @@ func fromCondition(c archive.Condition) conditionPayload {
 		KG:                 c.KG,
 		TransverseInertia:  c.TransverseInertia,
 		WaterDensity:       c.WaterDensity,
+		Tanks:              fromTanks(c.Tanks),
 	}
 }
 
-// resolveParams 在「引用档名」与「内联参数」两种方式中解析出一份内核参数。
-// 两者必须二选一；同名引用各自独立取档，计算过程互不渗透。
-func (s *Server) resolveParams(c *gin.Context, name string, inline *paramsPayload) (stability.Params, bool) {
+// conditionFromPayload 把建档请求体转为业务层档案；
+// tankPayload 与 stability.Tank 字段同名但类型独立，不能直接整体转换。
+func conditionFromPayload(p conditionPayload) archive.Condition {
+	return archive.Condition{
+		Name:               p.Name,
+		DisplacementVolume: p.DisplacementVolume,
+		KB:                 p.KB,
+		KG:                 p.KG,
+		TransverseInertia:  p.TransverseInertia,
+		WaterDensity:       p.WaterDensity,
+		Tanks:              toTanks(p.Tanks),
+	}
+}
+
+// loading 是一次核算/扫描解析出的浮态参数与液舱清单。
+type loading struct {
+	params stability.Params
+	tanks  []stability.Tank
+}
+
+// resolveLoading 在「引用档名」与「内联参数」两种方式中解析出浮态与液舱。
+// 两者必须二选一：
+//   - 引用档名：浮态与液舱都取自该份档案，档案里没有舱就不修正；
+//   - 内联参数：浮态取 params，液舱取请求体里的 tanks。
+//
+// 同名引用各自独立取档，计算过程互不渗透。
+func (s *Server) resolveLoading(c *gin.Context, name string, inline *paramsPayload, tanks []tankPayload) (loading, bool) {
 	hasName := name != ""
 	hasInline := inline != nil
 	switch {
 	case hasName && hasInline:
 		badRequest(c, "conditionName 与 params 只能二选一，不能同时给出")
-		return stability.Params{}, false
+		return loading{}, false
 	case hasName:
-		p, err := s.Conditions.ResolveParams(name)
+		if len(tanks) > 0 {
+			badRequest(c, "引用档名时液舱以档案内登记的为准；要临时挂舱做试算请改用内联 params+tanks")
+			return loading{}, false
+		}
+		p, t, err := s.Conditions.ResolveLoading(name)
 		if err != nil {
 			abortByError(c, err)
-			return stability.Params{}, false
+			return loading{}, false
 		}
-		return p, true
+		return loading{params: p, tanks: t}, true
 	case hasInline:
-		return toParams(*inline), true
+		return loading{params: toParams(*inline), tanks: toTanks(tanks)}, true
 	default:
 		badRequest(c, "必须给出 conditionName（引用已存档档名）或 params（内联浮态参数）")
-		return stability.Params{}, false
+		return loading{}, false
 	}
 }
 
@@ -139,12 +217,12 @@ func (s *Server) evaluate(c *gin.Context) {
 		badRequest(c, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	p, ok := s.resolveParams(c, req.ConditionName, req.Params)
+	l, ok := s.resolveLoading(c, req.ConditionName, req.Params, req.Tanks)
 	if !ok {
 		return
 	}
 
-	result, err := stability.Evaluate(p, req.AngleDeg)
+	result, err := stability.EvaluateLoading(l.params, l.tanks, req.AngleDeg)
 	if err != nil {
 		abortByError(c, err)
 		return
@@ -166,13 +244,14 @@ func (s *Server) scan(c *gin.Context) {
 		badRequest(c, "扫描必须显式给出 startDeg、endDeg 与 stepDeg（度）")
 		return
 	}
-	p, ok := s.resolveParams(c, req.ConditionName, req.Params)
+	l, ok := s.resolveLoading(c, req.ConditionName, req.Params, req.Tanks)
 	if !ok {
 		return
 	}
 
 	result, err := stability.Scan(stability.ScanParams{
-		Params:   p,
+		Params:   l.params,
+		Tanks:    l.tanks,
 		StartDeg: *req.StartDeg,
 		EndDeg:   *req.EndDeg,
 		StepDeg:  *req.StepDeg,
@@ -203,7 +282,7 @@ func (s *Server) createCondition(c *gin.Context) {
 		badRequest(c, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	cond := archive.Condition(payload)
+	cond := conditionFromPayload(payload)
 	if err := s.Conditions.Save(cond); err != nil {
 		abortByError(c, err)
 		return
@@ -228,7 +307,7 @@ func (s *Server) putCondition(c *gin.Context) {
 		return
 	}
 	payload.Name = c.Param("name")
-	cond := archive.Condition(payload)
+	cond := conditionFromPayload(payload)
 	if err := s.Conditions.Save(cond); err != nil {
 		abortByError(c, err)
 		return
